@@ -1,5 +1,8 @@
 import os
 import json
+import time
+import threading
+import queue
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from llama_cpp import Llama
@@ -68,32 +71,120 @@ class BasicService:
         print(f"Model loaded successfully")
 
     def generate_streaming_response(self, message_history, temperature=0.7, max_tokens=16384, top_p=0.8, top_k=20):
-        try:
-            response = self.model.create_chat_completion(
-                messages=message_history,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                min_p=0,
-                stream=True,
-                stop=["<|im_end|>"],
-            )
+        # Configuration for batching
+        FLUSH_INTERVAL = 0.15  # 150ms
+        MAX_BUFFER_SIZE = 800  # ~160 tokens
 
-            for chunk in response:
-                if 'choices' in chunk and len(chunk['choices']) > 0:
-                    choice = chunk['choices'][0]
+        # Shared state between threads
+        buffer = ""
+        buffer_lock = threading.Lock()
+        should_stop = threading.Event()
+        output_queue = queue.Queue()
+        error_occurred = threading.Event()
 
-                    if 'delta' in choice and 'content' in choice['delta']:
-                        content = choice['delta']['content']
-                        yield f"data: {json.dumps({'content': content, 'done': False})}\n\n"
+        def flush_worker():
+            """Background thread that flushes buffer every 150ms"""
+            nonlocal buffer
+            last_flush_time = time.time()
 
-                    elif choice.get('finish_reason') is not None:
-                        yield f"data: {json.dumps({'done': True, 'finish_reason': choice['finish_reason']})}\n\n"
+            while not should_stop.is_set():
+                current_time = time.time()
+
+                # Check if it's time to flush or if we should stop
+                if (current_time - last_flush_time >= FLUSH_INTERVAL) or should_stop.is_set():
+                    with buffer_lock:
+                        if buffer:  # Only flush if there's content
+                            output_queue.put(f"data: {json.dumps({'content': buffer, 'done': False})}\n\n")
+                            buffer = ""
+                            last_flush_time = current_time
+
+                # Small sleep to prevent busy waiting
+                time.sleep(0.01)
+
+            # Final flush when stopping
+            with buffer_lock:
+                if buffer:
+                    output_queue.put(f"data: {json.dumps({'content': buffer, 'done': False})}\n\n")
+
+        # Start the flush worker thread
+        flush_thread = threading.Thread(target=flush_worker, daemon=True)
+        flush_thread.start()
+
+        def token_collector():
+            """Collects tokens from the model and adds them to buffer"""
+            nonlocal buffer
+
+            try:
+                response = self.model.create_chat_completion(
+                    messages=message_history,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=0,
+                    stream=True,
+                    stop=["<|im_end|>"],
+                )
+
+                for chunk in response:
+                    if should_stop.is_set():
                         break
 
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e), 'done': True})}\n\n"
+                    if 'choices' in chunk and len(chunk['choices']) > 0:
+                        choice = chunk['choices'][0]
+
+                        if 'delta' in choice and 'content' in choice['delta']:
+                            content = choice['delta']['content']
+
+                            with buffer_lock:
+                                buffer += content
+
+                                # Check if buffer is getting too large
+                                if len(buffer) >= MAX_BUFFER_SIZE:
+                                    output_queue.put(f"data: {json.dumps({'content': buffer, 'done': False})}\n\n")
+                                    buffer = ""
+
+                        elif choice.get('finish_reason') is not None:
+                            # Signal completion
+                            should_stop.set()
+                            output_queue.put(
+                                f"data: {json.dumps({'done': True, 'finish_reason': choice['finish_reason']})}\n\n")
+                            break
+
+            except Exception as e:
+                error_occurred.set()
+                should_stop.set()
+                output_queue.put(f"data: {json.dumps({'error': str(e), 'done': True})}\n\n")
+
+        # Start token collection in a separate thread
+        collector_thread = threading.Thread(target=token_collector, daemon=True)
+        collector_thread.start()
+
+        # Yield responses from the output queue
+        try:
+            while True:
+                try:
+                    # Get response with timeout to periodically check if we should stop
+                    response = output_queue.get(timeout=0.1)
+                    yield response
+
+                    # Check if this was the final message
+                    if '"done": true' in response:
+                        break
+
+                except queue.Empty:
+                    # Check if both threads are done and queue is empty
+                    if should_stop.is_set() and output_queue.empty():
+                        break
+                    continue
+
+        finally:
+            # Cleanup: ensure threads are stopped
+            should_stop.set()
+
+            # Wait for threads to complete (with timeout)
+            flush_thread.join(timeout=1.0)
+            collector_thread.join(timeout=1.0)
 
 
 # Create FastAPI app and service instance
