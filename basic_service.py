@@ -79,8 +79,10 @@ class BasicService:
         buffer = ""
         buffer_lock = threading.Lock()
         should_stop = threading.Event()
+        force_flush = threading.Event()
         output_queue = queue.Queue()
         error_occurred = threading.Event()
+        completion_info = {}
 
         def flush_worker():
             """Background thread that flushes buffer every 150ms"""
@@ -90,21 +92,20 @@ class BasicService:
             while not should_stop.is_set():
                 current_time = time.time()
 
-                # Check if it's time to flush or if we should stop
-                if (current_time - last_flush_time >= FLUSH_INTERVAL) or should_stop.is_set():
+                # Check if it's time to flush, force flush requested, or if we should stop
+                if (current_time - last_flush_time >= FLUSH_INTERVAL) or force_flush.is_set():
                     with buffer_lock:
                         if buffer:  # Only flush if there's content
                             output_queue.put(f"data: {json.dumps({'content': buffer, 'done': False})}\n\n")
                             buffer = ""
                             last_flush_time = current_time
 
+                    # Clear force flush flag after processing
+                    if force_flush.is_set():
+                        force_flush.clear()
+
                 # Small sleep to prevent busy waiting
                 time.sleep(0.01)
-
-            # Final flush when stopping
-            with buffer_lock:
-                if buffer:
-                    output_queue.put(f"data: {json.dumps({'content': buffer, 'done': False})}\n\n")
 
         # Start the flush worker thread
         flush_thread = threading.Thread(target=flush_worker, daemon=True)
@@ -112,7 +113,7 @@ class BasicService:
 
         def token_collector():
             """Collects tokens from the model and adds them to buffer"""
-            nonlocal buffer
+            nonlocal buffer, completion_info
 
             try:
                 response = self.model.create_chat_completion(
@@ -145,14 +146,30 @@ class BasicService:
                                     buffer = ""
 
                         elif choice.get('finish_reason') is not None:
-                            # Signal completion
-                            should_stop.set()
+                            # Store completion info
+                            completion_info['finish_reason'] = choice['finish_reason']
+
+                            # Force flush any remaining buffer content FIRST
+                            force_flush.set()
+
+                            # Wait a moment for flush to complete
+                            time.sleep(0.05)
+
+                            # Now send completion signal
                             output_queue.put(
                                 f"data: {json.dumps({'done': True, 'finish_reason': choice['finish_reason']})}\n\n")
+
+                            # Signal to stop everything
+                            should_stop.set()
                             break
 
             except Exception as e:
                 error_occurred.set()
+
+                # Force flush any remaining buffer content before error
+                force_flush.set()
+                time.sleep(0.05)
+
                 should_stop.set()
                 output_queue.put(f"data: {json.dumps({'error': str(e), 'done': True})}\n\n")
 
@@ -181,10 +198,11 @@ class BasicService:
         finally:
             # Cleanup: ensure threads are stopped
             should_stop.set()
+            force_flush.set()  # Make sure any final content gets flushed
 
-            # Wait for threads to complete (with timeout)
-            flush_thread.join(timeout=1.0)
-            collector_thread.join(timeout=1.0)
+            # Wait for threads to complete (with longer timeout for final flush)
+            flush_thread.join(timeout=2.0)
+            collector_thread.join(timeout=2.0)
 
 
 # Create FastAPI app and service instance
