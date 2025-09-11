@@ -57,8 +57,8 @@ def download_hf_model(repo_id, filename, models_dir="models"):
 
 class BasicService:
     def __init__(self):
-        model_path = download_hf_model("unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
-                                       "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf")
+        model_path = download_hf_model("unsloth/Qwen3-14B-GGUF",
+                                       "Qwen3-14B-Q4_K_M.gguf")
 
         self.model = Llama(
             model_path=model_path,
@@ -66,6 +66,11 @@ class BasicService:
             n_gpu_layers=-1,
             n_threads=8,
             verbose=False,
+            n_batch=512,  # Increase batch size for faster processing
+            use_mmap=True,  # Memory-map the model file
+            use_mlock=True,  # Lock model in memory to prevent swapping
+            f16_kv=True,  # Use half-precision for key-value cache
+            logits_all=False,  # Only compute logits for last token
         )
 
         print(f"Model loaded successfully")
