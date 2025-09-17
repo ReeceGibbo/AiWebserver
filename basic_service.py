@@ -264,8 +264,8 @@ async def lifespan(app: FastAPI):
 
     # Download model if needed
     model_path = download_hf_model(
-        "unsloth/gpt-oss-20b-GGUF",
-        "gpt-oss-20b-Q4_K_M.gguf"
+        "unsloth/Qwen3-4B-Thinking-2507-GGUF",
+        "Qwen3-4B-Thinking-2507-Q4_K_M.gguf"
     )
 
     # Initialize worker pool
