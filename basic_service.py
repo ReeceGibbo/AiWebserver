@@ -264,8 +264,8 @@ async def lifespan(app: FastAPI):
 
     # Download model if needed
     model_path = download_hf_model(
-        "unsloth/Mistral-Small-3.2-24B-Instruct-2506-GGUF",
-        "Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M.gguf"
+        "MaziyarPanahi/Llama-3.3-70B-Instruct-GGUF",
+        "Llama-3.3-70B-Instruct.Q2_K.gguf"
     )
 
     # Initialize worker pool
